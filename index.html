@@ -477,6 +477,7 @@ dialog::backdrop { background: rgba(10,12,30,.5); }
           <div class="field"><label for="syncUrl">Sync URL</label><input type="url" id="syncUrl" placeholder="https://your-app.vercel.app/api/sync" maxlength="500"></div>
           <div class="field"><label for="syncKey">Sync secret key</label><input type="password" id="syncKey" autocomplete="off" maxlength="200"></div>
         </div>
+        <label class="row" style="font-weight:600; margin:0 0 12px; cursor:pointer"><input type="checkbox" id="syncAuto"> Auto-sync: push a few seconds after each change, pull when the app opens or comes back into view</label>
         <div class="row"><button class="btn primary" id="pushBtn">Push to cloud</button><button class="btn" id="pullBtn">Pull from cloud</button><span class="muted small" id="syncInfo"></span></div>
       </div>
       <div class="card">
@@ -775,7 +776,7 @@ function seedState() {
       readiness: Object.entries(READINESS).flatMap(([g, items]) => items.map(t => ({ id: uid(), group: g, text: t, done: false }))) },
     topics: {},
     apps: [],
-    sync: { url: '', key: '', base: '', lastSynced: '' }
+    sync: { url: '', key: '', base: '', lastSynced: '', auto: true }
   };
 }
 
@@ -835,7 +836,7 @@ function sanitizeState(input) {
     apps: S.arr(raw.apps, 2000).map(S.obj).map(a => ({ id: S.id(a.id), company: S.str(a.company, 200), title: S.str(a.title, 200), url: S.url(a.url),
       applied: S.date(a.applied), reqs: S.str(a.reqs, 3000), match: S.str(a.match, 3000), response: S.pick(a.response, RESPONSES),
       stage: S.pick(a.stage, STAGES), feedback: S.str(a.feedback, 3000), next: S.str(a.next, 300), followUp: S.date(a.followUp) })),
-    sync: { url: S.url(sy.url), key: S.str(sy.key, 200), base: S.iso(sy.base), lastSynced: S.iso(sy.lastSynced) }
+    sync: { url: S.url(sy.url), key: S.str(sy.key, 200), base: S.iso(sy.base), lastSynced: S.iso(sy.lastSynced), auto: sy.auto !== false }
   };
   if (st.settings.targetMax < st.settings.targetMin) st.settings.targetMax = st.settings.targetMin;
   return st;
@@ -865,6 +866,7 @@ function changed() {
   setSaveState('Saving…');
   clearTimeout(saveTimer); saveTimer = setTimeout(persist, 400);
   refreshTopbar();
+  scheduleAutoSync();
 }
 function setSaveState(text, err) { const el = $('#saveState'); el.textContent = text; el.classList.toggle('err', !!err); }
 // Data that leaves the device never contains the sync secret.
@@ -1430,6 +1432,7 @@ function renderSettings() {
   $('#setTheme').value = st.theme; $('#setStart').value = st.startDate; $('#setMin').value = st.targetMin; $('#setMax').value = st.targetMax;
   $('#syncUrl').value = state.sync.url; $('#syncKey').value = state.sync.key;
   $('#syncInfo').textContent = 'Last synced: ' + fmtTime(state.sync.lastSynced);
+  $('#syncAuto').checked = state.sync.auto;
   let size = 0; try { size = new Blob([JSON.stringify(state)]).size; } catch (e) {}
   $('#storageInfo').textContent = storageOK ? `Stored in this browser under "${STORAGE_KEY}" · ${(size / 1024).toFixed(1)} KB · last change ${fmtTime(state.updatedAt)}`
     : 'Browser storage is blocked (private mode or site data disabled). Changes will be lost when you close this tab; export a backup.';
@@ -1517,7 +1520,7 @@ async function checkShareHash() {
 }
 
 /* =========================================================
-   19. CLOUD SYNC (talks to sync.php)
+   19. CLOUD SYNC (talks to api/sync on Vercel or sync.php)
    ========================================================= */
 async function syncRequest(method, body) {
   const { url, key } = state.sync;
@@ -1537,9 +1540,14 @@ async function syncRequest(method, body) {
     throw new Error(e.name === 'AbortError' ? 'Sync timed out.' : e instanceof TypeError ? 'Could not reach the server (network, CORS or HTTPS problem).' : e.message);
   } finally { clearTimeout(timer); }
 }
-function markSynced(updatedAt) { state.sync.base = updatedAt; state.sync.lastSynced = new Date().toISOString(); persist(); renderSettings(); }
+function markSynced(updatedAt) {
+  state.sync.base = updatedAt; state.sync.lastSynced = new Date().toISOString(); persist();
+  $('#syncInfo').textContent = 'Last synced: ' + fmtTime(state.sync.lastSynced);
+}
 const localDirty = () => state.updatedAt !== state.sync.base;
-async function conflictChoice(remote) {
+async function conflictChoice(remote, firstSync) {
+  if (firstSync) return choose('First sync on this device', `The cloud already has data from another device.\n\nCloud: ${fmtTime(remote.updatedAt)}\n${summary(remote)}\n\nThis device: ${fmtTime(state.updatedAt)}\n${summary(state)}\n\nUse the cloud data here, or replace the cloud with this device's data?`,
+    [{ label: 'Cancel', value: null }, { label: 'Keep this device', value: 'local' }, { label: 'Use cloud data', value: 'remote', primary: true }]);
   return choose('Sync conflict', `Both versions changed since the last sync.\n\nThis device: ${fmtTime(state.updatedAt)}\n${summary(state)}\n\nCloud: ${fmtTime(remote.updatedAt)}\n${summary(remote)}\n\nWhich version do you want to keep?`,
     [{ label: 'Cancel', value: null }, { label: 'Keep cloud', value: 'remote' }, { label: 'Keep this device', value: 'local', primary: true }]);
 }
@@ -1553,10 +1561,7 @@ async function pushSync() {
       if (!pick) return;
       if (pick === 'remote') { loadData(remote); markSynced(remote.updatedAt); toast('Kept the cloud version'); return; }
     }
-    const body = JSON.stringify(exportable());
-    if (body.length > 1024 * 1024) throw new Error('Data is over 1 MB, which sync.php will not accept.');
-    await syncRequest('POST', body);
-    markSynced(state.updatedAt); toast('Pushed to cloud');
+    await pushNow(); toast('Pushed to cloud');
   } catch (e) { toast('Push failed: ' + e.message); }
 }
 async function pullSync() {
@@ -1574,6 +1579,49 @@ async function pullSync() {
     loadData(remote); markSynced(remote.updatedAt); toast('Pulled from cloud');
   } catch (e) { toast('Pull failed: ' + e.message); }
 }
+
+// Uploads this device's data. Records the version that was sent, so edits made during the upload stay "unsynced".
+async function pushNow() {
+  const sentAt = state.updatedAt, body = JSON.stringify(exportable());
+  if (body.length > 1024 * 1024) throw new Error('Data is over 1 MB, which the sync server will not accept.');
+  await syncRequest('POST', body);
+  markSynced(sentAt);
+}
+
+// ---- Auto-sync: push shortly after changes, pull on open / return / every minute.
+let syncBusy = false, autoTimer = null;
+const autoSyncOn = () => state.sync.auto && !!state.sync.url && !!state.sync.key;
+const isTyping = () => { const a = document.activeElement; return !!a && (a.tagName === 'TEXTAREA' || (a.tagName === 'INPUT' && !['checkbox', 'radio', 'file'].includes(a.type))); };
+function scheduleAutoSync(delay = 3000) { if (!autoSyncOn()) return; clearTimeout(autoTimer); autoTimer = setTimeout(autoSync, delay); }
+async function autoSync() {
+  clearTimeout(autoTimer);
+  if (!autoSyncOn() || document.querySelector('dialog[open]')) return;
+  if (syncBusy) { scheduleAutoSync(); return; }
+  syncBusy = true;
+  try {
+    if (saveTimer) persist();
+    const remoteRaw = await syncRequest('GET'), remote = remoteRaw && sanitizeState(remoteRaw);
+    if (remoteRaw && !remote) throw new Error('Cloud data is not valid.');
+    const remoteChanged = remote && remote.updatedAt !== state.sync.base;
+    if (remote && remote.updatedAt === state.updatedAt) markSynced(remote.updatedAt);
+    else if (remoteChanged && localDirty()) {                // both sides changed, or first sync on this device
+      const pick = await conflictChoice(remote, !state.sync.base);
+      if (pick === 'remote') { loadData(remote); markSynced(remote.updatedAt); toast('Loaded the cloud version'); }
+      else if (pick === 'local') { await pushNow(); toast('Cloud updated from this device'); }
+      else return;                                           // cancelled: ask again next time
+    } else if (remoteChanged) {                              // only the cloud changed
+      if (isTyping()) { scheduleAutoSync(10000); return; }   // don't swap data under the cursor
+      loadData(remote); markSynced(remote.updatedAt); toast('Updated from cloud');
+    } else if (localDirty()) await pushNow();                // only this device changed
+    setSaveState('Synced');
+  } catch (e) {
+    setSaveState('Saved here · sync failed', true); console.warn('Auto-sync:', e.message);
+  } finally { syncBusy = false; }
+}
+document.addEventListener('visibilitychange', () => { if (autoSyncOn() && (!document.hidden || localDirty())) autoSync(); });
+addEventListener('focus', () => scheduleAutoSync(300));
+addEventListener('online', () => scheduleAutoSync(500));
+setInterval(() => { if (!document.hidden) autoSync(); }, 60000);
 
 /* =========================================================
    20. PRINT WEEKLY SUMMARY
@@ -1639,8 +1687,9 @@ function wire() {
   $('#setStart').onchange = e => { const d = S.date(e.target.value); if (d) { state.settings.startDate = d; openWeeks.clear(); roadmapInit = false; changed(); } };
   $('#setMin').onchange = e => { state.settings.targetMin = S.num(e.target.value, 1, 80, 10); if (state.settings.targetMax < state.settings.targetMin) state.settings.targetMax = state.settings.targetMin; changed(); renderSettings(); };
   $('#setMax').onchange = e => { state.settings.targetMax = Math.max(state.settings.targetMin, S.num(e.target.value, 1, 80, 14)); changed(); renderSettings(); };
-  $('#syncUrl').onchange = e => { state.sync.url = S.url(e.target.value); if (e.target.value && !state.sync.url) toast('Sync URL must start with https://'); persist(); };
-  $('#syncKey').onchange = e => { state.sync.key = S.str(e.target.value, 200); persist(); };
+  $('#syncUrl').onchange = e => { state.sync.url = S.url(e.target.value); if (e.target.value && !state.sync.url) toast('Sync URL must start with https://'); persist(); scheduleAutoSync(500); };
+  $('#syncKey').onchange = e => { state.sync.key = S.str(e.target.value, 200); persist(); scheduleAutoSync(500); };
+  $('#syncAuto').onchange = e => { state.sync.auto = e.target.checked; persist(); if (e.target.checked) scheduleAutoSync(300); };
   $('#pushBtn').onclick = pushSync; $('#pullBtn').onclick = pullSync;
   $('#exportBtn').onclick = exportJSON;
   $('#importFile').onchange = e => { importJSON(e.target.files[0]); e.target.value = ''; };
@@ -1663,7 +1712,7 @@ if (firstRun) persist(); // save the seeded plan (and start date) right away
 let startTab = 'dashboard'; try { startTab = sessionStorage.getItem('fde-tab') || 'dashboard'; } catch (e) {}
 showTab(startTab);
 if (!storageOK) setSaveState('Storage blocked', true);
-checkShareHash();
+checkShareHash().finally(() => scheduleAutoSync(800));
 </script>
 </body>
 </html>

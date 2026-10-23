@@ -80,7 +80,12 @@ Notes:
   - the data must be tracker data
   - the secret key is removed before saving, and the data is re-encoded
 - It stores one record (`fde-tracker:data`), so it uses almost nothing of the free tier.
-- Sync is not automatic on every change. Press Push when you finish on one device and Pull when you start on another. If both changed, the app asks which version to keep.
+- **Auto-sync** is on by default (Settings & sync → Auto-sync):
+  - Each device **pushes** about 3 seconds after any change.
+  - It **pulls** when the app opens, when you switch back to it, and every minute while it's open.
+  - If both devices changed since the last sync, it asks which version to keep. The first time a device connects, it asks whether to use the cloud data or this device's data.
+  - The top bar shows **Synced**, or **Saved here · sync failed** when you're offline (it retries automatically).
+- **Push / Pull** buttons still work for a manual sync.
 
 ## 3b. Alternative: cloud sync on PHP hosting
 
