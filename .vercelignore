@@ -1,0 +1,6 @@
+# Only index.html and api/ are deployed to Vercel.
+*.pdf
+sync.php
+.htaccess
+README.md
+*.json

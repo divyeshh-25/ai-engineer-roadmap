@@ -1,0 +1,4 @@
+# Keep personal files out of the repository.
+*.pdf
+*.json
+.vercel
